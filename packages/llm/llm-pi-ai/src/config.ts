@@ -14,7 +14,7 @@
  * @module dsh-llm-pi-ai/config
  */
 
-import type { CacheRetention, ChatTemplateKwargValue, ModelThinkingLevel, Provider, ThinkingBudgets, Transport } from '@earendil-works/pi-ai'
+import type { Api, CacheRetention, ChatTemplateKwargValue, Model, ModelThinkingLevel, Provider, ThinkingBudgets, Transport } from '@earendil-works/pi-ai'
 import z from '@deepseek-ai/schemastery'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
@@ -24,6 +24,8 @@ import type { ResolvedRetryPolicy, RetryPolicyConfig } from '@deepseek-ai/dsh-ll
 import {
   CACHE_CONTROL_FORMATS,
   CHAT_TEMPLATE_VARS,
+  listingBaseFor,
+  liveModelOverlay,
   MAX_TOKENS_FIELDS,
   MODALITIES,
   resolveRouteModels,
@@ -165,6 +167,17 @@ export interface PiAiProviderProfile {
   maxRequestImageBytes?: number
   /** Provider-owned model-request retry policy; omission uses normal mode with five retries. */
   retryPolicy?: RetryPolicyConfig
+  /**
+   * Overlay this route's OpenAI-compatible listing endpoint over the installed
+   * catalog on every discovery read, so the model selector shows the provider's
+   * current lineup instead of the catalog bundled at build time. The endpoint
+   * is derived from the route's `baseURL`, else from the first OpenAI-compatible
+   * baseline model's `baseUrl`; a route that names neither has nothing to list
+   * against and is refused. Newly advertised models become servable bare
+   * descriptors; installed models the endpoint no longer lists are dropped.
+   * Has no effect when a non-empty explicit `models` list curates the route.
+   */
+  refreshCatalog?: boolean
 }
 
 /** Validated profile with its route stamped and every adapter-owned default resolved. */
@@ -313,6 +326,7 @@ const profile = z.object({
   streamIdleTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
   maxRequestImageBytes: z.number().step(1).min(1).default(DEFAULT_MAX_REQUEST_IMAGE_BYTES),
   retryPolicy: RetryPolicySchema,
+  refreshCatalog: z.boolean(),
 })
 
 /** Runtime schema for {@link Config}. */
@@ -415,6 +429,31 @@ export function resolveProfiles(
       defaultContextWindow: source.defaultContextWindow ?? DEFAULT_CONTEXT_WINDOW,
       defaultMaxTokens: source.defaultMaxTokens ?? DEFAULT_MAX_TOKENS,
     })
+    // A non-empty explicit `models` list curates the route by hand; `refreshCatalog`
+    // would replace that curation with the endpoint's listing, so it is ignored.
+    const curated = source.models !== undefined && source.models.length > 0
+    const wantsLive = source.refreshCatalog === true && !curated
+    const baseline = new Map(catalog.models.map(model => [model.id, model]))
+    let listingBase: string | undefined
+    let fetchModels:
+      | ((apiKey: string | undefined, signal?: AbortSignal) => Promise<Model<Api>[]>)
+      | undefined
+    if (wantsLive) {
+      listingBase = listingBaseFor(baseline, source.baseURL)
+      if (listingBase === undefined) {
+        throw new Error(
+          `llm-pi-ai: provider "${provider}" sets refreshCatalog but no OpenAI-compatible listing`
+          + ' endpoint can be derived; set a baseURL, or drop refreshCatalog',
+        )
+      }
+      const routeDefaults: Parameters<typeof liveModelOverlay>[2] = {
+        provider,
+        defaultContextWindow: source.defaultContextWindow ?? DEFAULT_CONTEXT_WINDOW,
+        defaultMaxTokens: source.defaultMaxTokens ?? DEFAULT_MAX_TOKENS,
+        defaultInput,
+      }
+      fetchModels = (apiKey, signal) => liveModelOverlay(listingBase as string, baseline, routeDefaults, apiKey, signal)
+    }
     const { apiKeyEnv, retryPolicy, models: _models, displayName: _displayName, ...rest } = source
     resolved.set(provider, {
       ...rest,
@@ -434,6 +473,8 @@ export function resolveProfiles(
         ...source.baseURL === undefined ? {} : { baseURL: source.baseURL },
         models: catalog.models,
         namesCredential: apiKeyEnv !== undefined,
+        ...wantsLive ? { refreshCatalog: true } : {},
+        ...fetchModels === undefined ? {} : { fetchModels },
       }),
     })
   }

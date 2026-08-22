@@ -14,6 +14,7 @@
 
 import { builtinProviders, getBuiltinModels, getBuiltinProviders } from '@earendil-works/pi-ai/providers/all'
 import type { BuiltinProvider } from '@earendil-works/pi-ai/providers/all'
+import { fetchOpenAiListing } from './discovery.ts'
 import type {
   AnthropicMessagesCompat,
   Api,
@@ -910,4 +911,114 @@ export function resolveRouteModels(request: RouteCatalogRequest): RouteCatalog {
       + ` it exists on ${takers.join(', ')}`)
   }
   return { models, configuredMaxTokens }
+}
+
+/**
+ * The endpoint a `refreshCatalog` route interrogates for its live model
+ * listing. Derived from the route's own `baseURL` when set, else from the
+ * first OpenAI-compatible baseline model's `baseUrl` — the provider ships its
+ * `GET /models` alongside the OpenAI-completions/responses models, so that
+ * model's endpoint is the listing origin. A route that names neither and whose
+ * catalog carries no OpenAI-compatible model has nothing to list against, so
+ * this returns `undefined` and resolution refuses the route rather than
+ * inventing an endpoint.
+ * @param defaults - the route's resolved baseline models (installed catalog plus overrides).
+ * @param routeBaseURL - the profile's explicit `baseURL`, when set.
+ * @returns the listing origin with no trailing slash, or `undefined` when none can be derived.
+ */
+export function listingBaseFor(
+  defaults: ReadonlyMap<string, Model<Api>>,
+  routeBaseURL?: string,
+): string | undefined {
+  const openai = [...defaults.values()].find(
+    model => model.api === 'openai-completions' || model.api === 'openai-responses',
+  )
+  const base = routeBaseURL ?? openai?.baseUrl
+  return base === undefined ? undefined : base.replace(/\/+$/, '')
+}
+
+/**
+ * The resolved facts {@link liveModelOverlay} needs about the route.
+ */
+export interface LiveOverlayRequest {
+  /** Provider route key, stamped onto every materialized model. */
+  provider: string
+  /** Context capacity for a model neither the entry nor the catalog sizes. */
+  defaultContextWindow: number
+  /** Output capability for a model neither the entry nor the catalog sizes. */
+  defaultMaxTokens: number
+  /** Modalities for a model neither the entry nor the catalog declares. */
+  defaultInput: Model<Api>['input']
+}
+
+/**
+ * Build the live model overlay for one `refreshCatalog` route by interrogating
+ * its OpenAI-compatible listing endpoint.
+ *
+ * The overlay is the provider's *current* lineup, so it diverges from the
+ * installed catalog in three ways and each is intentional:
+ * - an installed id the endpoint still advertises keeps its authored metadata
+ *   (context window, compat, reasoning) — the listing endpoint reports none of
+ *   that, and overwriting a rich catalog entry with a bare row would lose it;
+ * - an id the endpoint advertises but the installed catalog does not becomes a
+ *   servable descriptor inheriting the route's OpenAI template (protocol,
+ *   endpoint, compat, reasoning), so selecting it in the picker actually
+ *   dispatches rather than failing `UNKNOWN_MODEL`;
+ * - an installed id the endpoint no longer advertises is dropped, so a model
+ *   the provider retired does not linger in the selector.
+ *
+ * A `refreshCatalog` route with an explicit `models` list curates its lineup
+ * by hand and is left untouched (see {@link resolveRouteModels}); this overlay
+ * only replaces the installed catalog for a route that relied on it.
+ * @param listingBase - the endpoint origin returned by {@link listingBaseFor}.
+ * @param defaults - the route's resolved baseline models.
+ * @param request - the route-level facts the overlay needs.
+ * @param apiKey - the resolved bearer key, or `undefined` for an unauthenticated probe.
+ * @param signal - cancellation; an aborted call rejects up to the caller.
+ * @returns the overlay models in endpoint order, known metadata first.
+ * @throws LlmError when the endpoint refuses, fails, or answers non-JSON.
+ */
+export async function liveModelOverlay(
+  listingBase: string,
+  defaults: ReadonlyMap<string, Model<Api>>,
+  request: LiveOverlayRequest,
+  apiKey: string | undefined,
+  signal?: AbortSignal,
+): Promise<Model<Api>[]> {
+  const discovered = await fetchOpenAiListing(listingBase, apiKey, signal)
+  const template = [...defaults.values()].find(
+    model => model.api === 'openai-completions' || model.api === 'openai-responses',
+  )
+  const seen = new Set<string>()
+  const overlay: Model<Api>[] = []
+  for (const entry of discovered) {
+    if (seen.has(entry.id)) continue
+    seen.add(entry.id)
+    const known = defaults.get(entry.id)
+    if (known !== undefined) {
+      overlay.push(known)
+      continue
+    }
+    // A newly advertised id has no catalog metadata; inherit the route's
+    // OpenAI template so it is immediately servable, then lay the listing's own
+    // facts over it. `...template` carries the protocol, endpoint, compat, and
+    // reasoning map; the id/provider/baseUrl/name/input/capacities below win.
+    // `listingBaseFor` guarantees an OpenAI baseline model (so `template` is
+    // set) whenever this function is reached through a valid route; if it is
+    // somehow absent, skip the id rather than emit an unservable descriptor.
+    /* v8 ignore next -- listingBaseFor guarantees an OpenAI baseline model before a route can reach this overlay. */
+    if (template === undefined) continue
+    overlay.push({
+      ...template,
+      id: entry.id,
+      provider: request.provider,
+      baseUrl: listingBase,
+      name: entry.name ?? entry.id,
+      input: [...request.defaultInput],
+      contextWindow: entry.contextWindow ?? request.defaultContextWindow,
+      maxTokens: entry.maxTokens ?? request.defaultMaxTokens,
+      cost: NO_COST,
+    })
+  }
+  return overlay
 }

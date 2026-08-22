@@ -229,7 +229,6 @@ export async function discoverModels(
       'DISCOVERY_UNSUPPORTED',
     )
   }
-  const url = listingUrl(request.baseURL)
   // A key typed into the form wins: it is the one the user is testing, and it
   // may be the replacement for exactly the stored key that is failing. The
   // stored one is only asked for here, past the catalog short-circuit and the
@@ -239,6 +238,27 @@ export async function discoverModels(
   // relies on the provider's own ambient discovery is meant to be asked.
   const supplied = request.apiKey ?? await storedApiKey?.()
   const apiKey = supplied === undefined ? undefined : usableProbeKey(supplied)
+  const discovered = await fetchOpenAiListing(request.baseURL, apiKey, request.signal)
+  return discovered
+}
+
+/**
+ * Interrogate one endpoint for its OpenAI-compatible `GET /models` listing,
+ * independent of any catalog short-circuit or protocol gate. Shared by the
+ * settings "fetch available models" action and the live catalog overlay a
+ * `refreshCatalog` route builds on every discovery read.
+ * @param baseURL - the endpoint base; `/models` is appended.
+ * @param apiKey - a usable bearer key, or `undefined` for an unauthenticated probe.
+ * @param signal - cancellation; an aborted call rejects with `ABORTED`.
+ * @returns the advertised models in endpoint order.
+ * @throws LlmError when the endpoint refuses, fails, or answers non-JSON.
+ */
+export async function fetchOpenAiListing(
+  baseURL: string,
+  apiKey: string | undefined,
+  signal?: AbortSignal,
+): Promise<readonly LlmDiscoveredModel[]> {
+  const url = listingUrl(baseURL)
   let response: Response
   try {
     response = await fetch(url, {
@@ -248,10 +268,10 @@ export async function discoverModels(
         ...apiKey === undefined ? {} : { authorization: `Bearer ${apiKey}` },
         ...attributionHeaders(),
       },
-      ...request.signal === undefined ? {} : { signal: request.signal },
+      ...signal === undefined ? {} : { signal },
     })
   } catch (error: unknown) {
-    if (request.signal?.aborted) {
+    if (signal?.aborted) {
       throw new LlmError('model discovery aborted by caller', 'ABORTED', { cause: error })
     }
     throw new LlmError(`could not reach ${url}`, 'DISCOVERY_FAILED', { cause: error })
@@ -269,7 +289,7 @@ export async function discoverModels(
     // Cancellation during the body read rejects with the abort reason, which
     // may be any value; the caller gets the same coded failure it would have
     // for a cancellation before the request went out.
-    if (request.signal?.aborted) {
+    if (signal?.aborted) {
       throw new LlmError('model discovery aborted by caller', 'ABORTED', { cause: error })
     }
     throw error

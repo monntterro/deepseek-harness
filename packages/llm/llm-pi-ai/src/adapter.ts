@@ -28,6 +28,8 @@ import type {
   Models,
   ModelThinkingLevel,
   MutableModels,
+  ProviderModelsStore,
+  RefreshModelsContext,
   SimpleStreamOptions,
   ThinkingLevel,
 } from '@earendil-works/pi-ai'
@@ -81,6 +83,25 @@ export interface PiAiAdapterOptions {
    * conversion because its stored replay state is unusable by this build.
    */
   onReplayDegrade?: (detail: { provider: string; model: string; reason: string }) => void
+  /**
+   * Observe a `refreshCatalog` route's live refresh failing. The adapter
+   * swallows the failure and serves the last good (static) catalog, so this is
+   * the only signal the operator gets that a live listing was unavailable.
+   */
+  onCatalogRefreshError?: (detail: { provider: string; error: unknown }) => void
+}
+
+/**
+ * Stateless in-memory provider model store. A `refreshCatalog` route refetches
+ * its listing on every discovery read and persists nothing durable across the
+ * process, so the store only needs to satisfy pi-ai's `refreshModels` contract
+ * without restoring a stale overlay.
+ */
+const inMemoryProviderStore: ProviderModelsStore = {
+  read: () => Promise.resolve(undefined),
+  write: () => Promise.resolve(),
+  /* v8 ignore next -- pi-ai's refreshModels never removes a provider-scoped overlay; delete is contract-only here. */
+  delete: () => Promise.resolve(),
 }
 
 /** Copy profile stream knobs into pi-ai's common option vocabulary. */
@@ -240,17 +261,45 @@ export class PiAiAdapter extends LlmAdapter {
     return this.current().profiles.get(provider)?.retryPolicy
   }
 
-  override listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    return Promise.resolve().then(() => {
-      const snapshot = this.current()
-      this.profileOf(snapshot, provider)
-      return snapshot.models.getModels(provider).map(model => ({
-        provider,
-        id: model.id,
-        name: model.name,
-        inputModalities: [...model.input],
-      }))
-    })
+  override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
+    const snapshot = this.current()
+    const profile = this.profileOf(snapshot, provider)
+    // A refreshCatalog route overlays its endpoint's live listing; the selector
+    // reads this RPC on every open, so each open reflects the provider's
+    // current lineup. A failed refresh is swallowed: the static baseline
+    // already loaded below keeps serving, and the error is reported for the
+    // operator, not the selector.
+    if (profile.refreshCatalog && typeof profile.piProvider.refreshModels === 'function') {
+      await this.refreshRoute(profile).catch((error: unknown) => {
+        this.config.onCatalogRefreshError?.({ provider, error })
+      })
+    }
+    return snapshot.models.getModels(provider).map(model => ({
+      provider,
+      id: model.id,
+      name: model.name,
+      inputModalities: [...model.input],
+    }))
+  }
+
+  /**
+   * Refresh one `refreshCatalog` route's live overlay. The route is dynamic, so
+   * pi-ai merges the fetched overlay over its static baseline and keeps the
+   * models servable through the same `Models` collection.
+   * @param profile - the resolved route whose provider owns `refreshModels`.
+   */
+  private async refreshRoute(profile: ResolvedPiAiProviderProfile): Promise<void> {
+    /* v8 ignore next -- the caller guards on a function before invoking refreshRoute. */
+    if (typeof profile.piProvider.refreshModels !== 'function') return
+    const apiKey = await this.config.resolveApiKey(profile.provider, profile)
+    const context: RefreshModelsContext = {
+      store: inMemoryProviderStore,
+      allowNetwork: true,
+    }
+    if (apiKey !== undefined) {
+      context.credential = { type: 'api_key', key: apiKey }
+    }
+    await profile.piProvider.refreshModels(context)
   }
 
   override resolveModel(

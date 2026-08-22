@@ -20,7 +20,7 @@
  */
 
 import { createProvider } from '@earendil-works/pi-ai'
-import type { Api, ApiKeyAuth, Model, Provider, ProviderStreams } from '@earendil-works/pi-ai'
+import type { Api, ApiKeyAuth, Model, Provider, ProviderStreams, RefreshModelsContext } from '@earendil-works/pi-ai'
 import { anthropicMessagesApi } from '@earendil-works/pi-ai/api/anthropic-messages.lazy'
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy'
 import { openAIResponsesApi } from '@earendil-works/pi-ai/api/openai-responses.lazy'
@@ -104,6 +104,15 @@ export interface ProviderSpec {
    * request, never at construction.
    */
   namesCredential: boolean
+  /**
+   * When set, the provider is built dynamic: its advertised catalog overlays
+   * the endpoint's live `GET /models` listing on every refresh, and the live
+   * models become servable. {@link fetchModels} performs the wire fetch with
+   * the resolved credential.
+   */
+  refreshCatalog?: boolean
+  /** The live-listing fetch for a {@link refreshCatalog} route; absent otherwise. */
+  fetchModels?: (apiKey: string | undefined, signal?: AbortSignal) => Promise<Model<Api>[]>
 }
 
 /**
@@ -159,6 +168,47 @@ function reuseCatalogProvider(base: Provider, spec: ProviderSpec): Provider {
 }
 
 /**
+ * The wire-protocol map one route streams through. A route with an explicit
+ * `api` resolves to that single protocol; otherwise the map is every protocol
+ * its baseline models actually use that this build can serve. A catalog route
+ * keeps its own protocols, and a gateway with no catalog defaults to OpenAI
+ * Completions — the shape its listing endpoint must speak.
+ * @param spec - the resolved route facts.
+ * @param catalog - the installed catalog provider, when pi-ai ships one.
+ * @returns the protocol-to-streams map createProvider accepts.
+ * @throws Error when the route names a wire protocol this build cannot serve.
+ */
+function apiMapForSpec(spec: ProviderSpec): Partial<Record<Api, ProviderStreams>> {
+  if (spec.api !== undefined) {
+    const factory = PROTOCOLS[spec.api]
+    if (factory === undefined) {
+      throw new Error(
+        `llm-pi-ai: provider "${spec.provider}" names api "${spec.api}", which this build cannot serve;`
+        + ` supported protocols are ${supportedProtocols().join(', ')}`,
+      )
+    }
+    return { [spec.api]: factory() }
+  }
+  const registry = PROTOCOLS as Record<string, () => ProviderStreams>
+  const map: Partial<Record<Api, ProviderStreams>> = {}
+  for (const model of spec.models) {
+    const factory = registry[model.api]
+    if (factory !== undefined && map[model.api] === undefined) {
+      map[model.api] = factory()
+    }
+  }
+  /* v8 ignore start -- a valid refreshCatalog route always has an OpenAI-compatible baseline model
+     (listingBaseFor refuses a route without one), so its protocol is in PROTOCOLS and this fallback is unreachable. */
+  if (Object.keys(map).length > 0) return map
+  // No catalog and no recognized protocol: an OpenAI-compatible gateway is the
+  // only listing shape this build can interrogate, so it is the safe default.
+  const fallback = PROTOCOLS['openai-completions']
+  if (fallback === undefined) return {}
+  return { 'openai-completions': fallback() }
+  /* v8 ignore stop */
+}
+
+/**
  * Build the pi-ai provider for one resolved route.
  * @param spec - the resolved route facts.
  * @returns the provider to register in the adapter's `Models` collection.
@@ -169,24 +219,48 @@ export function buildProvider(spec: ProviderSpec): Provider {
   // A catalog route keeping its catalog protocol reuses the catalog provider;
   // an explicit protocol means the deployment is repointing the route at a
   // different wire format, which only the protocol table can serve.
-  if (catalog !== undefined && spec.api === undefined) return reuseCatalogProvider(catalog, spec)
+  if (!spec.refreshCatalog) {
+    if (catalog !== undefined && spec.api === undefined) return reuseCatalogProvider(catalog, spec)
 
-  // Every model on this path carries the route's protocol: model resolution
-  // requires one for a route the catalog cannot default, and an explicit one
-  // replaces each catalog model's own. So the route has a single API.
-  const factory = spec.api === undefined ? undefined : PROTOCOLS[spec.api]
-  if (factory === undefined) {
-    throw new Error(
-      `llm-pi-ai: provider "${spec.provider}" names api "${spec.api}", which this build cannot serve;`
-      + ` supported protocols are ${supportedProtocols().join(', ')}`,
-    )
+    // Every model on this path carries the route's protocol: model resolution
+    // requires one for a route the catalog cannot default, and an explicit one
+    // replaces each catalog model's own. So the route has a single API.
+    const factory = spec.api === undefined ? undefined : PROTOCOLS[spec.api]
+    if (factory === undefined) {
+      throw new Error(
+        `llm-pi-ai: provider "${spec.provider}" names api "${spec.api}", which this build cannot serve;`
+        + ` supported protocols are ${supportedProtocols().join(', ')}`,
+      )
+    }
+    return createProvider({
+      id: spec.provider,
+      name: spec.displayName,
+      ...spec.baseURL === undefined ? {} : { baseUrl: spec.baseURL },
+      auth: routeAuth(spec, catalog),
+      models: spec.models,
+      api: factory(),
+    })
   }
+
+  // A refreshCatalog route registers as a dynamic provider: createProvider
+  // merges its live overlay over the baseline on refresh and keeps the models
+  // servable through the same collection, so a selector listing a fresh id and
+  // a stream selecting it read one source of truth.
+  const apiMap = apiMapForSpec(spec)
+  const fetchModels = spec.fetchModels
   return createProvider({
     id: spec.provider,
     name: spec.displayName,
     ...spec.baseURL === undefined ? {} : { baseUrl: spec.baseURL },
     auth: routeAuth(spec, catalog),
     models: spec.models,
-    api: factory(),
+    api: apiMap,
+    /* v8 ignore next -- config resolution always supplies fetchModels on a refreshCatalog route. */
+    ...fetchModels === undefined
+      ? {}
+      : {
+        fetchModels: (context: RefreshModelsContext) =>
+          fetchModels((context.credential as { key?: string } | undefined)?.key, context.signal),
+      },
   })
 }

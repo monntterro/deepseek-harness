@@ -207,6 +207,13 @@ export function apply(ctx: Context, config: Config): void {
         + ` sending that message as provider-neutral content (${reason})`,
       )
     },
+    onCatalogRefreshError: ({ provider, error }) => {
+      /* v8 ignore next -- every refresh rejection this plugin can produce is an Error (LlmError). */
+      const detail = error instanceof Error ? error.message : String(error)
+      ctx.logger.warn(
+        `llm-pi-ai: live model listing for route "${provider}" failed; serving the static catalog (${detail})`,
+      )
+    },
   })
   // The full installed catalog is configurable from the moment the plugin
   // mounts — dormant or not — so configuration surfaces can offer every
